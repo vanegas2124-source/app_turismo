@@ -1,0 +1,381 @@
+import 'dart:async';
+
+import 'package:flutter/foundation.dart';
+import 'package:hive_ce_flutter/hive_flutter.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+
+import '../models/activity_recommendation.dart';
+import '../models/activity_survey.dart';
+import '../models/available_activity.dart';
+import '../models/safe_route.dart';
+import '../data/default_safe_routes.dart';
+import 'recommendation_api_service.dart';
+import 'supabase_service.dart';
+
+class ActivitySurveyService {
+  ActivitySurveyService._({
+    SupabaseClient? client,
+    RecommendationApiService? apiService,
+  })  : _client = client,
+        _apiService = apiService ?? RecommendationApiService();
+
+  static final ActivitySurveyService instance = ActivitySurveyService._();
+
+  final SupabaseClient? _client;
+  final RecommendationApiService _apiService;
+
+  SupabaseClient get _supabaseClient => _client ?? SupabaseService.instance.client;
+
+  String? _currentUserId;
+  bool _isInitialized = false;
+  bool _isUsingCachedRecommendations = false;
+  DateTime? _recommendationsCacheDate;
+
+  static const String _surveyBoxName = 'activity_surveys_cache';
+  static const String _recommendationsBoxName = 'activity_recommendations_cache';
+  static const String _cacheDateBoxName = 'recommendations_metadata';
+
+  final ValueNotifier<ActivitySurvey?> _surveyNotifier =
+      ValueNotifier<ActivitySurvey?>(null);
+  final ValueNotifier<List<ActivityRecommendation>> _recommendationsNotifier =
+      ValueNotifier<List<ActivityRecommendation>>(<ActivityRecommendation>[]);
+
+  ValueListenable<ActivitySurvey?> get surveyListenable => _surveyNotifier;
+  ValueListenable<List<ActivityRecommendation>> get recommendationsListenable =>
+      _recommendationsNotifier;
+
+  bool get hasCompletedSurvey => _surveyNotifier.value != null;
+  bool get isUsingCachedRecommendations => _isUsingCachedRecommendations;
+  DateTime? get recommendationsCacheDate => _recommendationsCacheDate;
+
+  Future<void> initializeForUser(String userId) async {
+    if (_isInitialized && _currentUserId == userId) {
+      return;
+    }
+
+    _currentUserId = userId;
+
+    try {
+      final ActivitySurvey? survey = await _fetchSurvey(userId);
+      _surveyNotifier.value = survey;
+      if (survey != null) {
+        await _saveSurveyToLocal(userId, survey);
+      }
+    } catch (error) {
+      debugPrint('Error al cargar encuesta de Supabase: $error');
+      // Intentar cargar desde caché local
+      final ActivitySurvey? cachedSurvey = await _loadSurveyFromLocal(userId);
+      _surveyNotifier.value = cachedSurvey;
+    }
+
+    try {
+      final List<ActivityRecommendation> recommendations =
+          await _fetchRecommendations(userId);
+      _recommendationsNotifier.value =
+          List<ActivityRecommendation>.from(recommendations);
+      _isUsingCachedRecommendations = false;
+      _recommendationsCacheDate = null;
+      
+      if (recommendations.isNotEmpty) {
+        await _saveRecommendationsToLocal(userId, recommendations);
+      }
+    } catch (error) {
+      debugPrint('Error al cargar recomendaciones de Supabase: $error');
+      // Intentar cargar desde caché local
+      final List<ActivityRecommendation> cachedRecs = 
+          await _loadRecommendationsFromLocal(userId);
+      _recommendationsNotifier.value = List<ActivityRecommendation>.from(cachedRecs);
+      _isUsingCachedRecommendations = cachedRecs.isNotEmpty;
+      
+      if (_isUsingCachedRecommendations) {
+        _recommendationsCacheDate = await _getRecommendationsCacheDate(userId);
+      }
+    }
+
+    _isInitialized = true;
+  }
+
+  // --- Métodos de Caché Local ---
+
+  Future<void> _saveSurveyToLocal(String userId, ActivitySurvey survey) async {
+    await Hive.initFlutter();
+    final box = await Hive.openBox(_surveyBoxName);
+    await box.put(userId, survey.toJson());
+  }
+
+  Future<ActivitySurvey?> _loadSurveyFromLocal(String userId) async {
+    await Hive.initFlutter();
+    final box = await Hive.openBox(_surveyBoxName);
+    final data = box.get(userId);
+    if (data == null) return null;
+    return ActivitySurvey.fromJson(Map<String, dynamic>.from(data));
+  }
+
+  Future<void> _saveRecommendationsToLocal(
+    String userId, 
+    List<ActivityRecommendation> recommendations,
+  ) async {
+    await Hive.initFlutter();
+    final box = await Hive.openBox(_recommendationsBoxName);
+    final metaBox = await Hive.openBox(_cacheDateBoxName);
+    
+    final List<Map<String, dynamic>> rawRecs = 
+        recommendations.map((r) => r.toJson()).toList();
+    
+    await box.put(userId, rawRecs);
+    await metaBox.put('${userId}_date', DateTime.now().toIso8601String());
+  }
+
+  Future<List<ActivityRecommendation>> _loadRecommendationsFromLocal(String userId) async {
+    await Hive.initFlutter();
+    final box = await Hive.openBox(_recommendationsBoxName);
+    final List<dynamic>? data = box.get(userId);
+    if (data == null) return [];
+    
+    return data.map((item) => 
+      ActivityRecommendation.fromJson(Map<String, dynamic>.from(item))
+    ).toList();
+  }
+
+  Future<DateTime?> _getRecommendationsCacheDate(String userId) async {
+    await Hive.initFlutter();
+    final metaBox = await Hive.openBox(_cacheDateBoxName);
+    final String? dateStr = metaBox.get('${userId}_date');
+    if (dateStr == null) return null;
+    return DateTime.tryParse(dateStr);
+  }
+
+  // --- Fin Métodos de Caché Local ---
+
+  Future<ActivitySurvey?> _fetchSurvey(String userId) async {
+    final Map<String, dynamic>? response = await _supabaseClient
+        .from('user_activity_surveys')
+        .select()
+        .eq('user_id', userId)
+        .maybeSingle();
+
+    if (response == null) {
+      return null;
+    }
+
+    final Map<String, dynamic> rawResponses =
+        Map<String, dynamic>.from(
+      response['responses'] as Map<dynamic, dynamic>? ?? <dynamic, dynamic>{},
+    );
+
+    final ActivitySurvey baseSurvey = ActivitySurvey.fromJson(rawResponses);
+    final DateTime? completedAt = (response['completed_at'] as String?) != null
+        ? DateTime.tryParse(response['completed_at'] as String)
+        : baseSurvey.completedAt;
+
+    return baseSurvey.copyWith(completedAt: completedAt);
+  }
+
+  Future<List<ActivityRecommendation>> _fetchRecommendations(
+    String userId,
+  ) async {
+    final List<dynamic> response = await _supabaseClient
+        .from('activity_recommendations')
+        .select()
+        .eq('user_id', userId)
+        .order('created_at', ascending: false);
+
+    return response
+        .map((dynamic item) {
+          final Map<String, dynamic> data =
+              Map<String, dynamic>.from(item as Map<dynamic, dynamic>);
+          return ActivityRecommendation.fromJson(<String, dynamic>{
+            'activityName': data['activity_name'],
+            'summary': data['summary'],
+            'location': data['location'],
+            'confidence': data['confidence'],
+            'tags': data['tags'],
+            'createdAt': data['created_at'],
+          });
+        })
+        .toList();
+  }
+
+  Future<void> submitSurvey(ActivitySurvey survey) async {
+    final String userId = _ensureUserId();
+    final DateTime completedAt = DateTime.now().toUtc();
+    final ActivitySurvey surveyToSave =
+        survey.copyWith(completedAt: completedAt);
+
+    try {
+      debugPrint('[ActivitySurveyService] Guardando respuestas de encuesta en Supabase...');
+      await _supabaseClient.from('user_activity_surveys').upsert(
+        <String, dynamic>{
+          'user_id': userId,
+          'responses': surveyToSave.toJson(),
+          'completed_at': completedAt.toIso8601String(),
+        },
+        onConflict: 'user_id',
+      ).timeout(const Duration(seconds: 15));
+    } catch (e) {
+      debugPrint('[ActivitySurveyService] Advertencia: Falló guardado de encuesta en Supabase: $e');
+    }
+
+    _surveyNotifier.value = surveyToSave;
+    await _saveSurveyToLocal(userId, surveyToSave);
+
+    final List<AvailableActivity> availableActivities =
+        await _loadAvailableActivities();
+
+    debugPrint('[ActivitySurveyService] Solicitando recomendaciones al AI Service...');
+    final List<ActivityRecommendation> recommendations =
+        await _apiService.generateRecommendations(
+      userId: userId,
+      survey: surveyToSave,
+      availableActivities: availableActivities,
+    );
+
+    debugPrint('[ActivitySurveyService] Recomendaciones recibidas exitosamente: ${recommendations.length}');
+    try {
+      debugPrint('[ActivitySurveyService] Guardando recomendaciones en Supabase...');
+      await _persistRecommendations(userId, recommendations).timeout(const Duration(seconds: 15));
+    } catch (e) {
+      debugPrint('[ActivitySurveyService] Advertencia: Falló guardado de recomendaciones en Supabase: $e');
+    }
+
+    debugPrint('[ActivitySurveyService] Guardando recomendaciones en caché local...');
+    await _saveRecommendationsToLocal(userId, recommendations);
+
+    _recommendationsNotifier.value =
+        List<ActivityRecommendation>.from(recommendations);
+    _isUsingCachedRecommendations = false;
+    _recommendationsCacheDate = null;
+  }
+
+  Future<void> refreshRecommendations() async {
+    final String userId = _ensureUserId();
+    final ActivitySurvey? survey = _surveyNotifier.value;
+    if (survey == null) {
+      throw StateError('No se ha completado el cuestionario del usuario.');
+    }
+
+    final List<AvailableActivity> availableActivities =
+        await _loadAvailableActivities();
+
+    debugPrint('[ActivitySurveyService] Solicitando nuevas recomendaciones al AI Service...');
+    final List<ActivityRecommendation> recommendations =
+        await _apiService.generateRecommendations(
+      userId: userId,
+      survey: survey,
+      availableActivities: availableActivities,
+    );
+    
+    debugPrint('[ActivitySurveyService] Recomendaciones generadas exitosamente: ${recommendations.length}');
+    try {
+      debugPrint('[ActivitySurveyService] Guardando nuevas recomendaciones en Supabase...');
+      await _persistRecommendations(userId, recommendations).timeout(const Duration(seconds: 15));
+    } catch (e) {
+      debugPrint('[ActivitySurveyService] Advertencia: Falló guardado de nuevas recomendaciones en Supabase: $e');
+    }
+
+    debugPrint('[ActivitySurveyService] Guardando nuevas recomendaciones en caché local...');
+    await _saveRecommendationsToLocal(userId, recommendations);
+
+    _recommendationsNotifier.value =
+        List<ActivityRecommendation>.from(recommendations);
+    _isUsingCachedRecommendations = false;
+    _recommendationsCacheDate = null;
+  }
+
+  Future<void> _persistRecommendations(
+    String userId,
+    List<ActivityRecommendation> recommendations,
+  ) async {
+    await _supabaseClient
+        .from('activity_recommendations')
+        .delete()
+        .eq('user_id', userId);
+
+    if (recommendations.isEmpty) {
+      return;
+    }
+
+    final List<Map<String, dynamic>> payload = recommendations
+        .map((ActivityRecommendation recommendation) => <String, dynamic>{
+              'user_id': userId,
+              'activity_name': recommendation.activityName,
+              'summary': recommendation.summary,
+              'location': recommendation.location,
+              'confidence': recommendation.confidence,
+              'tags': recommendation.tags,
+              'created_at': recommendation.createdAt.toUtc().toIso8601String(),
+            })
+        .toList();
+
+    await _supabaseClient.from('activity_recommendations').insert(payload);
+  }
+
+  Future<void> clearForSignOut() async {
+    _currentUserId = null;
+    _isInitialized = false;
+    _surveyNotifier.value = null;
+    _recommendationsNotifier.value = <ActivityRecommendation>[];
+  }
+
+  String _ensureUserId() {
+    final String? userId = _currentUserId;
+    if (userId == null) {
+      throw StateError('No hay un usuario autenticado configurado.');
+    }
+    return userId;
+  }
+
+  Future<List<AvailableActivity>> _loadAvailableActivities() async {
+    List<SafeRoute> routes = <SafeRoute>[];
+
+    try {
+      debugPrint('[ActivitySurveyService] Cargando actividades disponibles (safe_routes) desde Supabase...');
+      final List<dynamic> response = await _supabaseClient
+          .from('safe_routes')
+          .select('name, description, difficulty, points_of_interest')
+          .timeout(const Duration(seconds: 15));
+
+      routes = response
+          .map((dynamic item) {
+            final Map<String, dynamic> data =
+                Map<String, dynamic>.from(item as Map<dynamic, dynamic>);
+            return SafeRoute(
+              name: data['name'] as String? ?? '',
+              duration: '',
+              difficulty: data['difficulty'] as String? ?? '',
+              description: data['description'] as String? ?? '',
+              pointsOfInterest: (data['points_of_interest'] as List<dynamic>? ??
+                      <dynamic>[])
+                  .map((dynamic value) => value.toString())
+                  .where((String value) => value.trim().isNotEmpty)
+                  .toList(),
+            );
+          })
+          .where((SafeRoute route) => route.pointsOfInterest.isNotEmpty)
+          .toList();
+
+      debugPrint('[ActivitySurveyService] Rutas cargadas desde Supabase exitosamente: ${routes.length}');
+    } catch (error) {
+      debugPrint('[ActivitySurveyService] Error al cargar actividades disponibles de Supabase: $error');
+    }
+
+    if (routes.isEmpty) {
+      debugPrint('[ActivitySurveyService] Utilizando rutas locales por defecto (defaultSafeRoutes).');
+      routes = defaultSafeRoutes;
+    }
+
+    final Set<String> seen = <String>{};
+    final List<AvailableActivity> activities = <AvailableActivity>[];
+
+    for (final SafeRoute route in routes) {
+      for (final String activity in route.pointsOfInterest) {
+        final String key = '${route.name}::$activity'.toLowerCase();
+        if (seen.add(key)) {
+          activities.add(AvailableActivity.fromSafeRoute(route, activity));
+        }
+      }
+    }
+
+    return activities;
+  }
+}

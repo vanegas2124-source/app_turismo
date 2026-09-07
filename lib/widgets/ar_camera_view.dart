@@ -1,0 +1,1162 @@
+import 'dart:async';
+import 'dart:math' as math;
+
+import 'package:camera/camera.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_compass/flutter_compass.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:sensors_plus/sensors_plus.dart';
+
+import '../models/danger_zone.dart';
+import '../models/danger_zone_point.dart';
+import '../models/geo_point.dart';
+import '../services/ar_calculation_service.dart';
+
+class ArCameraView extends StatefulWidget {
+  const ArCameraView({
+    super.key,
+    required this.dangerZones,
+    required this.initialPosition,
+  });
+
+  final List<DangerZone> dangerZones;
+  final Position initialPosition;
+
+  @override
+  State<ArCameraView> createState() => _ArCameraViewState();
+}
+
+class _ArCameraViewState extends State<ArCameraView> {
+  final ArCalculationService _arService = const ArCalculationService();
+  static const double _overlayMinDistanceMeters = 450;
+
+  CameraController? _cameraController;
+  StreamSubscription<Position>? _positionSubscription;
+  StreamSubscription<CompassEvent>? _compassSubscription;
+  StreamSubscription<AccelerometerEvent>? _accelerometerSubscription;
+
+  Position? _userPosition;
+  double _heading = 0;
+  double _pitch = 0;
+  bool _isCameraInitializing = true;
+  String? _cameraError;
+  DateTime _lastUiUpdate = DateTime.now();
+
+  // Overlay state: whether the full detail panel is expanded
+  bool _isOverlayExpanded = false;
+  String? _focusedPointId;
+  double? _focusedPointDistance;
+
+  @override
+  void initState() {
+    super.initState();
+    _userPosition = widget.initialPosition;
+    unawaited(_initializeCamera());
+    _startPositionUpdates();
+    _startCompassUpdates();
+    _startAccelerometerUpdates();
+  }
+
+  @override
+  void dispose() {
+    _positionSubscription?.cancel();
+    _compassSubscription?.cancel();
+    _accelerometerSubscription?.cancel();
+    _cameraController?.dispose();
+    super.dispose();
+  }
+
+  Future<void> _initializeCamera() async {
+    final PermissionStatus status = await Permission.camera.request();
+    if (!status.isGranted) {
+      setState(() {
+        _cameraError = 'Permiso de cámara denegado';
+        _isCameraInitializing = false;
+      });
+      return;
+    }
+
+    try {
+      final List<CameraDescription> cameras = await availableCameras();
+      final CameraDescription selectedCamera = cameras.firstWhere(
+        (camera) => camera.lensDirection == CameraLensDirection.back,
+        orElse: () => cameras.isNotEmpty ? cameras.first : throw StateError('No hay cámaras disponibles'),
+      );
+
+      final CameraController controller = CameraController(
+        selectedCamera,
+        ResolutionPreset.medium,
+        enableAudio: false,
+      );
+
+      await controller.initialize();
+
+      if (!mounted) {
+        await controller.dispose();
+        return;
+      }
+
+      setState(() {
+        _cameraController = controller;
+        _isCameraInitializing = false;
+      });
+    } catch (error) {
+      setState(() {
+        _cameraError = 'No se pudo iniciar la cámara: $error';
+        _isCameraInitializing = false;
+      });
+    }
+  }
+
+  void _startPositionUpdates() {
+    _positionSubscription = Geolocator.getPositionStream(
+      locationSettings: const LocationSettings(
+        accuracy: LocationAccuracy.best,
+        distanceFilter: 5,
+      ),
+    ).listen(
+      (Position position) {
+        _throttledSetState(() {
+          _userPosition = position;
+        });
+      },
+      onError: (Object error) {
+        _throttledSetState(() {
+          _cameraError = 'Sin acceso a ubicación: $error';
+        });
+      },
+    );
+  }
+
+  void _startCompassUpdates() {
+    _compassSubscription = FlutterCompass.events?.listen((CompassEvent event) {
+      final double? heading = event.heading;
+      if (heading == null) {
+        return;
+      }
+      _throttledSetState(() {
+        _heading = heading;
+      });
+    });
+  }
+
+  void _startAccelerometerUpdates() {
+    _accelerometerSubscription = accelerometerEventStream().listen((AccelerometerEvent event) {
+      final double pitchRadians = math.atan2(
+        event.x,
+        math.sqrt((event.y * event.y) + (event.z * event.z)),
+      );
+      final double pitchDegrees = pitchRadians * 180 / math.pi;
+
+      _throttledSetState(() {
+        _pitch = pitchDegrees.clamp(-90, 90);
+      });
+    });
+  }
+
+  void _throttledSetState(VoidCallback updater) {
+    final DateTime now = DateTime.now();
+    if (now.difference(_lastUiUpdate).inMilliseconds < 33) {
+      return;
+    }
+    _lastUiUpdate = now;
+    if (mounted) {
+      setState(updater);
+    }
+  }
+
+  List<_PointContext> _pointsWithinRadius({double radiusInMeters = 1200}) {
+    final Position? userPosition = _userPosition;
+    if (userPosition == null) {
+      return const <_PointContext>[];
+    }
+
+    final GeoPoint userGeoPoint =
+        GeoPoint(userPosition.latitude, userPosition.longitude);
+    final List<_PointContext> contexts = <_PointContext>[];
+
+    for (final DangerZone zone in widget.dangerZones) {
+      // 1. Add all sub-points (DangerZonePoint)
+      for (final DangerZonePoint point in zone.points) {
+        final double distance =
+            _arService.calculateDistance(userGeoPoint, point.location);
+        if (distance > radiusInMeters) {
+          continue;
+        }
+
+        final double bearing =
+            _arService.calculateBearing(userGeoPoint, point.location);
+        contexts.add(
+          _PointContext(
+            zone: zone,
+            point: point,
+            distance: distance,
+            relativeBearing: _relativeBearing(bearing),
+          ),
+        );
+      }
+    }
+
+    contexts.sort(
+      (_PointContext a, _PointContext b) => a.distance.compareTo(b.distance),
+    );
+
+    return contexts;
+  }
+
+  Color _getPointColor(DangerZonePoint point, DangerZone zone) {
+    final DangerLevel level = point.level ?? zone.level;
+    switch (level) {
+      case DangerLevel.high:
+        return Colors.red;
+      case DangerLevel.massMovement:
+        return Colors.orange;
+      case DangerLevel.monitored:
+        return Colors.yellow.shade700;
+      case DangerLevel.low:
+        return Colors.green;
+    }
+  }
+
+  Widget _buildCameraBackground() {
+    if (_cameraController != null && _cameraController!.value.isInitialized) {
+      return CameraPreview(_cameraController!);
+    }
+
+    if (_isCameraInitializing) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    return Container(
+      color: Colors.black,
+      alignment: Alignment.center,
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Text(
+          _cameraError ?? 'Cámara no disponible',
+          style: const TextStyle(color: Colors.white70),
+          textAlign: TextAlign.center,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildStatusPanel() {
+    final Position? position = _userPosition;
+    return Align(
+      alignment: Alignment.bottomCenter,
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.6),
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(16)),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                _StatusChip(label: 'Heading', value: '${_heading.toStringAsFixed(1)}°'),
+                _StatusChip(label: 'Pitch', value: '${_pitch.toStringAsFixed(1)}°'),
+                _StatusChip(
+                  label: 'GPS',
+                  value: position != null
+                      ? '${position.latitude.toStringAsFixed(5)}, ${position.longitude.toStringAsFixed(5)}'
+                      : 'Sin señal',
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  double _relativeBearing(double bearing) {
+    double normalized = (bearing - _heading) % 360;
+    if (normalized > 180) {
+      normalized -= 360;
+    } else if (normalized < -180) {
+      normalized += 360;
+    }
+    return normalized;
+  }
+
+  String _formatDistance(double meters) {
+    if (meters >= 1000) {
+      return '${(meters / 1000).toStringAsFixed(1)} km';
+    }
+    return '${meters.toStringAsFixed(0)} m';
+  }
+
+  Widget _buildDangerOverlay(BoxConstraints constraints) {
+    final Position? userPosition = _userPosition;
+    if (userPosition == null) {
+      return Align(
+        alignment: Alignment.topCenter,
+        child: Container(
+          margin: const EdgeInsets.all(12),
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: Colors.black.withValues(alpha: 0.65),
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: const Text(
+            'Sin señal GPS. Activa la ubicación para ver las zonas de peligro cercanas.',
+            style: TextStyle(color: Colors.white),
+            textAlign: TextAlign.center,
+          ),
+        ),
+      );
+    }
+
+    final List<_PointContext> points = _pointsWithinRadius();
+    // El overlay se activa para el punto más cercano dentro del FOV (±20°)
+    // y a una distancia que sea al menos el radio configurado del punto o 200 m,
+    // lo que sea mayor, para permitir avisos tempranos incluso con radios menores.
+    final List<_PointContext> pointsInFov = points.where((context) {
+      final double activationDistance =
+          math.max(context.point.radius, _overlayMinDistanceMeters);
+      return context.relativeBearing.abs() <= 20 &&
+          context.distance <= activationDistance;
+    }).toList();
+
+    _PointContext? focusedPoint;
+    if (points.isEmpty) {
+      focusedPoint = null;
+    } else if (_focusedPointId != null) {
+      // Find the current focused point in the new frame's points list
+      final currentPointInPool = points.firstWhere(
+        (p) => p.point.id == _focusedPointId,
+        orElse: () => _PointContext(
+          zone: points.first.zone,
+          point: points.first.point,
+          distance: 999999,
+          relativeBearing: 999,
+        ),
+      );
+
+      final double actDist = math.max(
+          currentPointInPool.point.radius, _overlayMinDistanceMeters);
+      final bool isCurrentValid = currentPointInPool.relativeBearing.abs() <= 20 &&
+          currentPointInPool.distance <= actDist;
+
+      if (isCurrentValid) {
+        // If current is valid, only replace if another is 15m closer
+        pointsInFov.sort((a, b) => a.distance.compareTo(b.distance));
+        final bestCandidate = pointsInFov.isNotEmpty ? pointsInFov.first : null;
+
+        if (bestCandidate != null &&
+            bestCandidate.point.id != _focusedPointId &&
+            (_focusedPointDistance ?? currentPointInPool.distance) -
+                    bestCandidate.distance >
+                15) {
+          focusedPoint = bestCandidate;
+        } else {
+          focusedPoint = currentPointInPool;
+        }
+      } else {
+        // Current is no longer valid, take the best available in FOV
+        pointsInFov.sort((a, b) => a.distance.compareTo(b.distance));
+        focusedPoint = pointsInFov.isNotEmpty ? pointsInFov.first : null;
+      }
+    } else {
+      // No current focus, take the best available in FOV
+      pointsInFov.sort((a, b) => a.distance.compareTo(b.distance));
+      focusedPoint = pointsInFov.isNotEmpty ? pointsInFov.first : null;
+    }
+
+    // Update state only when the focused point effectively changes
+    if (focusedPoint?.point.id != _focusedPointId) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          setState(() {
+            _isOverlayExpanded = false;
+            _focusedPointId = focusedPoint?.point.id;
+            _focusedPointDistance = focusedPoint?.distance;
+          });
+        }
+      });
+    } else if (focusedPoint != null) {
+      // Keep updating the distance of the current focused point for the next frame's comparison
+      _focusedPointDistance = focusedPoint.distance;
+    }
+
+    return Align(
+      alignment: Alignment.topCenter,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            AnimatedSwitcher(
+              duration: const Duration(milliseconds: 300),
+              child: () {
+                final point = focusedPoint;
+                if (point == null) return const SizedBox.shrink();
+
+                return _isOverlayExpanded
+                    ? _FocusedPointOverlay(
+                        key: ValueKey<String>('expanded_${point.point.id}'),
+                        pointContext: point,
+                        distanceLabel: _formatDistance(point.distance),
+                        zoneColor: _getPointColor(point.point, point.zone),
+                        onViewZonePoints: () =>
+                            _showZonePoints(point.zone, userPosition),
+                        onCollapse: () =>
+                            setState(() => _isOverlayExpanded = false),
+                      )
+                    : _WarningIconOverlay(
+                        key: ValueKey<String>('icon_${point.point.id}'),
+                        pointContext: point,
+                        distanceLabel: _formatDistance(point.distance),
+                        zoneColor: _getPointColor(point.point, point.zone),
+                        additionalPointsInFov: pointsInFov
+                            .where((p) => p.point.id != point.point.id)
+                            .length,
+                        onTap: () => setState(() => _isOverlayExpanded = true),
+                      );
+              }(),
+            ),
+            const SizedBox(height: 10),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                color: Colors.black.withValues(alpha: 0.50),
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: Colors.white12),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // Header compacto
+                  Row(
+                    children: [
+                      const Icon(Icons.assistant_photo, color: Colors.white54, size: 14),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(
+                          'Cercanos (${points.length})',
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                      Text(
+                        '${_heading.toStringAsFixed(0)}°',
+                        style: const TextStyle(color: Colors.white54, fontSize: 11),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  if (points.isEmpty)
+                    const Text(
+                      'Sin puntos a 1.2 km',
+                      style: TextStyle(color: Colors.white54, fontSize: 11),
+                    )
+                  else ...[
+                    ConstrainedBox(
+                      constraints: BoxConstraints(
+                        maxHeight: constraints.maxHeight * 0.28,
+                      ),
+                      child: () {
+                        final List<_PointGroup> groups = _groupPoints(points);
+                        final List<_PointGroup> compactGroups = groups.take(5).toList();
+                        final bool hasMore = groups.length > 5;
+
+                        return ListView.builder(
+                          itemCount: compactGroups.length + (hasMore ? 1 : 0),
+                          shrinkWrap: true,
+                          padding: EdgeInsets.zero,
+                          itemBuilder: (BuildContext context, int index) {
+                            if (index == compactGroups.length) {
+                              return Padding(
+                                padding: const EdgeInsets.only(top: 8, bottom: 4),
+                                child: InkWell(
+                                  onTap: () => _showAllNearbyPoints(points, userPosition),
+                                  child: Row(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    children: [
+                                      const Icon(Icons.list_alt_rounded,
+                                          color: Colors.white70, size: 14),
+                                      const SizedBox(width: 6),
+                                      Text(
+                                        'Ver todos (${points.length} puntos)',
+                                        style: const TextStyle(
+                                          color: Colors.white70,
+                                          fontSize: 12,
+                                          fontWeight: FontWeight.w600,
+                                          decoration: TextDecoration.underline,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              );
+                            }
+
+                            final _PointGroup group = compactGroups[index];
+                            final _PointContext rep = group.representative;
+                            final Color zoneCol = _getPointColor(rep.point, rep.zone);
+                            final int additionalCount = group.points.length - 1;
+
+                            return Padding(
+                              padding: const EdgeInsets.only(bottom: 6),
+                              child: Row(
+                                children: [
+                                  Transform.rotate(
+                                    angle: rep.relativeBearing * math.pi / 180,
+                                    child: Icon(
+                                      Icons.navigation_rounded,
+                                      color: zoneCol,
+                                      size: 16,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 6),
+                                  Expanded(
+                                    child: Row(
+                                      children: [
+                                        Flexible(
+                                          child: Text(
+                                            '${rep.point.title}  ${_formatDistance(rep.distance)}',
+                                            style: const TextStyle(
+                                              color: Colors.white,
+                                              fontSize: 12,
+                                              fontWeight: FontWeight.w500,
+                                            ),
+                                            overflow: TextOverflow.ellipsis,
+                                          ),
+                                        ),
+                                        if (additionalCount > 0) ...[
+                                          const SizedBox(width: 6),
+                                          Container(
+                                            padding: const EdgeInsets.symmetric(
+                                                horizontal: 6, vertical: 1),
+                                            decoration: BoxDecoration(
+                                              color: Colors.white.withValues(alpha: 0.15),
+                                              borderRadius: BorderRadius.circular(8),
+                                              border: Border.all(
+                                                  color: Colors.white24, width: 0.5),
+                                            ),
+                                            child: Text(
+                                              '+$additionalCount',
+                                              style: const TextStyle(
+                                                color: Colors.white70,
+                                                fontSize: 10,
+                                                fontWeight: FontWeight.bold,
+                                              ),
+                                            ),
+                                          ),
+                                        ],
+                                      ],
+                                    ),
+                                  ),
+                                  Text(
+                                    '${rep.relativeBearing.toStringAsFixed(0)}°',
+                                    style: const TextStyle(
+                                      color: Colors.white38,
+                                      fontSize: 11,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            );
+                          },
+                        );
+                      }(),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showZonePoints(DangerZone zone, Position userPosition) async {
+    if (!mounted) {
+      return;
+    }
+
+    final GeoPoint userGeoPoint = GeoPoint(userPosition.latitude, userPosition.longitude);
+    final List<_PointContext> zonePoints = zone.points
+        .map(
+          (DangerZonePoint point) => _PointContext(
+            zone: zone,
+            point: point,
+            distance: _arService.calculateDistance(userGeoPoint, point.location),
+            relativeBearing:
+                _relativeBearing(_arService.calculateBearing(userGeoPoint, point.location)),
+          ),
+        )
+        .toList()
+      ..sort((_PointContext a, _PointContext b) => a.distance.compareTo(b.distance));
+
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: Colors.black.withValues(alpha: 0.9),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (BuildContext context) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        'Puntos en ${zone.title}',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.close, color: Colors.white70),
+                      onPressed: () => Navigator.of(context).maybePop(),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                if (zonePoints.isEmpty)
+                  const Text(
+                    'No hay puntos asociados a esta zona.',
+                    style: TextStyle(color: Colors.white70),
+                  )
+                else
+                  ...zonePoints.map(
+                    (_PointContext pointData) => Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 8),
+                      child: Row(
+                        children: [
+                          Transform.rotate(
+                            angle: pointData.relativeBearing * math.pi / 180,
+                            child: Icon(
+                              Icons.navigation_rounded,
+                              color: _getPointColor(pointData.point, zone),
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  pointData.point.title,
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                                const SizedBox(height: 2),
+                                Text(
+                                  _formatDistance(pointData.distance),
+                                  style: const TextStyle(color: Colors.white70),
+                                ),
+                              ],
+                            ),
+                          ),
+                          Text(
+                            'Radio ${pointData.point.radius.toStringAsFixed(0)} m',
+                            style: const TextStyle(color: Colors.white70, fontSize: 12),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _showAllNearbyPoints(
+      List<_PointContext> points, Position userPosition) async {
+    if (!mounted) return;
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.black.withValues(alpha: 0.9),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (BuildContext context) {
+        return DraggableScrollableSheet(
+          initialChildSize: 0.6,
+          minChildSize: 0.4,
+          maxChildSize: 0.9,
+          expand: false,
+          builder: (context, scrollController) {
+            return SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        const Expanded(
+                          child: Text(
+                            'Todos los puntos cercanos',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 18,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.close, color: Colors.white70),
+                          onPressed: () => Navigator.of(context).maybePop(),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    Expanded(
+                      child: ListView.builder(
+                        controller: scrollController,
+                        itemCount: points.length,
+                        itemBuilder: (context, index) {
+                          final pointData = points[index];
+                          return Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 8),
+                            child: Row(
+                              children: [
+                                Transform.rotate(
+                                  angle:
+                                      pointData.relativeBearing * math.pi / 180,
+                                  child: Icon(
+                                    Icons.navigation_rounded,
+                                    color: _getPointColor(pointData.point, pointData.zone),
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        pointData.point.title,
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                          fontWeight: FontWeight.w700,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 2),
+                                      Text(
+                                        '${pointData.zone.title} • ${_formatDistance(pointData.distance)}',
+                                        style: const TextStyle(
+                                            color: Colors.white70),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: SafeArea(
+        child: LayoutBuilder(
+          builder: (BuildContext context, BoxConstraints constraints) {
+            return Stack(
+              children: [
+                Positioned.fill(child: _buildCameraBackground()),
+                Positioned.fill(child: _buildDangerOverlay(constraints)),
+                _buildStatusPanel(),
+                Positioned(
+                  top: 12,
+                  right: 12,
+                  child: FloatingActionButton.small(
+                    heroTag: 'close_ar_view',
+                    backgroundColor: Colors.black54,
+                    onPressed: () => Navigator.of(context).maybePop(),
+                    child: const Icon(Icons.close, color: Colors.white),
+                  ),
+                ),
+              ],
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  double _angularDiff(double a, double b) {
+    double diff = (a - b).abs() % 360;
+    if (diff > 180) diff = 360 - diff;
+    return diff;
+  }
+
+  List<_PointGroup> _groupPoints(List<_PointContext> contexts) {
+    if (contexts.isEmpty) return [];
+
+    final List<_PointGroup> groups = [];
+    final List<_PointContext> sortedContexts = List.from(contexts)
+      ..sort((a, b) => a.relativeBearing.compareTo(b.relativeBearing));
+
+    for (final context in sortedContexts) {
+      bool added = false;
+      for (final group in groups) {
+        if (_angularDiff(context.relativeBearing, group.representative.relativeBearing) < 8) {
+          group.points.add(context);
+          // If this point is closer than current representative, update representative
+          if (context.distance < group.representative.distance) {
+            group.representative = context;
+          }
+          added = true;
+          break;
+        }
+      }
+      if (!added) {
+        groups.add(_PointGroup(representative: context, points: [context]));
+      }
+    }
+
+    // Sort groups by distance of representative
+    groups.sort((a, b) => a.representative.distance.compareTo(b.representative.distance));
+
+    return groups;
+  }
+}
+
+class _PointGroup {
+  _PointContext representative;
+  final List<_PointContext> points;
+
+  _PointGroup({
+    required this.representative,
+    required this.points,
+  });
+}
+
+class _StatusChip extends StatelessWidget {
+  const _StatusChip({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.1),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.white24),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            label,
+            style: const TextStyle(color: Colors.white70, fontSize: 12),
+          ),
+          Text(
+            value,
+            style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _PointContext {
+  const _PointContext({
+    required this.zone,
+    required this.point,
+    required this.distance,
+    required this.relativeBearing,
+  });
+
+  final DangerZone zone;
+  final DangerZonePoint point;
+  final double distance;
+  final double relativeBearing;
+}
+
+class _FocusedPointOverlay extends StatelessWidget {
+  const _FocusedPointOverlay({
+    super.key,
+    required this.pointContext,
+    required this.distanceLabel,
+    required this.zoneColor,
+    required this.onViewZonePoints,
+    required this.onCollapse,
+  });
+
+  final _PointContext pointContext;
+  final String distanceLabel;
+  final Color zoneColor;
+  final VoidCallback onViewZonePoints;
+  final VoidCallback onCollapse;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.78),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: zoneColor.withValues(alpha: 0.6), width: 1.5),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Icon(Icons.warning_amber_rounded, color: zoneColor, size: 22),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '${pointContext.point.title} - ${pointContext.zone.title}',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 16,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      'Distancia: $distanceLabel',
+                      style: const TextStyle(color: Colors.white70),
+                    ),
+                  ],
+                ),
+              ),
+              // Collapse button
+              GestureDetector(
+                onTap: onCollapse,
+                child: Container(
+                  padding: const EdgeInsets.all(4),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.12),
+                    shape: BoxShape.circle,
+                  ),
+                  child: const Icon(Icons.close, color: Colors.white70, size: 18),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          if (pointContext.point.description.isNotEmpty)
+            Text(
+              pointContext.point.description,
+              style: const TextStyle(color: Colors.white70),
+            ),
+          const SizedBox(height: 8),
+          if (pointContext.point.precautions.isNotEmpty)
+            Text(
+              'Precauciones específicas: ${pointContext.point.precautions}',
+              style: const TextStyle(color: Colors.white70, fontSize: 12),
+            ),
+          if (pointContext.point.recommendations.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                'Recomendaciones: ${pointContext.point.recommendations}',
+                style: const TextStyle(color: Colors.white70, fontSize: 12),
+              ),
+            ),
+          const SizedBox(height: 6),
+          Text(
+            'Zona: ${pointContext.zone.description}',
+            style: const TextStyle(color: Colors.white70, fontSize: 12),
+          ),
+          Text(
+            'Nivel: ${(pointContext.point.level ?? pointContext.zone.level).name.toUpperCase()} | Radio de detección ${pointContext.point.radius.toStringAsFixed(0)} m',
+            style: const TextStyle(color: Colors.white70, fontSize: 12),
+          ),
+          const SizedBox(height: 10),
+          Align(
+            alignment: Alignment.centerRight,
+            child: TextButton.icon(
+              style: TextButton.styleFrom(
+                foregroundColor: Colors.white,
+                backgroundColor: Colors.white.withValues(alpha: 0.12),
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              ),
+              onPressed: onViewZonePoints,
+              icon: const Icon(Icons.list_alt),
+              label: Text('Ver otros puntos de ${pointContext.zone.title}'),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ── Compact warning icon shown before the user taps ──────────────────────────
+class _WarningIconOverlay extends StatefulWidget {
+  const _WarningIconOverlay({
+    super.key,
+    required this.pointContext,
+    required this.distanceLabel,
+    required this.zoneColor,
+    required this.onTap,
+    this.additionalPointsInFov = 0,
+  });
+
+  final _PointContext pointContext;
+  final String distanceLabel;
+  final Color zoneColor;
+  final VoidCallback onTap;
+  final int additionalPointsInFov;
+
+  @override
+  State<_WarningIconOverlay> createState() => _WarningIconOverlayState();
+}
+
+class _WarningIconOverlayState extends State<_WarningIconOverlay>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _pulseController;
+  late final Animation<double> _pulseAnimation;
+
+  @override
+  void initState() {
+    super.initState();
+    _pulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 900),
+    )..repeat(reverse: true);
+    _pulseAnimation = Tween<double>(begin: 0.85, end: 1.0).animate(
+      CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
+    );
+  }
+
+  @override
+  void dispose() {
+    _pulseController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final Color color = widget.zoneColor;
+    return GestureDetector(
+      onTap: widget.onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.70),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: color.withValues(alpha: 0.7), width: 1.5),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // Pulsing warning icon
+            ScaleTransition(
+              scale: _pulseAnimation,
+              child: Icon(
+                Icons.warning_amber_rounded,
+                color: color,
+                size: 36,
+              ),
+            ),
+            const SizedBox(width: 12),
+            Flexible(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    widget.pointContext.point.title,
+                    style: TextStyle(
+                      color: color,
+                      fontSize: 15,
+                      fontWeight: FontWeight.w700,
+                    ),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    widget.distanceLabel,
+                    style: const TextStyle(
+                      color: Colors.white70,
+                      fontSize: 13,
+                    ),
+                  ),
+                  if (widget.additionalPointsInFov > 0)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 2),
+                      child: Text(
+                        'y ${widget.additionalPointsInFov} puntos más en esta dirección',
+                        style: const TextStyle(
+                          color: Colors.white54,
+                          fontSize: 10,
+                          fontStyle: FontStyle.italic,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 10),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              decoration: BoxDecoration(
+                color: color.withValues(alpha: 0.18),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: color.withValues(alpha: 0.4)),
+              ),
+              child: Text(
+                'Ver info',
+                style: TextStyle(
+                  color: color,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
